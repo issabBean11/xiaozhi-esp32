@@ -233,6 +233,8 @@ private:
             }
             app.ToggleChatState();
         });
+        // secret easter egg: double-click = yarn ball toy (double-click again to put it away)
+        boot_button_.OnDoubleClick([]() { bean::ToggleYarn(); });
     }
 
     int DisplayPort_DispReset() {
@@ -340,6 +342,31 @@ private:
                                Settings bean_settings("bean", true);
                                bean_settings.SetInt("fur", t);
                                return true;
+                           });
+        // Bean Bean: focus / rest timer with a glowing ring around her screen
+        mcp_server.AddTool("self.bean.start_timer",
+                           "Start a visual timer on Bean Bean's screen (a glowing ring that slowly empties, with the time left). "
+                           "Use for focus sessions, body doubling, pomodoro, chores, or breaks. kind is 'focus' or 'break'. "
+                           "When it finishes, Bean Bean cheers out loud.",
+                           PropertyList({Property("minutes", kPropertyTypeInteger, 1, 180),
+                                         Property("kind", kPropertyTypeString, std::string("focus"))}),
+                           [](const PropertyList& properties) -> ReturnValue {
+                               int minutes = properties["minutes"].value<int>();
+                               auto kind = properties["kind"].value<std::string>();
+                               bean::StartTimer(minutes, kind.find("break") != std::string::npos || kind.find("rest") != std::string::npos);
+                               return true;
+                           });
+        mcp_server.AddTool("self.bean.stop_timer", "Stop and hide Bean Bean's timer.", PropertyList(),
+                           [](const PropertyList& properties) -> ReturnValue {
+                               bean::StopTimer();
+                               return true;
+                           });
+        mcp_server.AddTool("self.bean.timer_status", "How many minutes and seconds are left on Bean Bean's timer (0 if none).", PropertyList(),
+                           [](const PropertyList& properties) -> ReturnValue {
+                               int s = bean::TimerSecondsLeft();
+                               char buf[48];
+                               snprintf(buf, sizeof(buf), "%d minutes %d seconds left", s / 60, s % 60);
+                               return std::string(buf);
                            });
         // Bean Bean: wireless self-update from her GitHub (keeps Wi-Fi and settings)
         mcp_server.AddTool("self.bean.update_software",
