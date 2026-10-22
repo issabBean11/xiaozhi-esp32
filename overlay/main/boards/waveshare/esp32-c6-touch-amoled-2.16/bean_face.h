@@ -54,6 +54,7 @@ private:
     float lid_ = 0, vlid_ = 0, slant_ = 0, vslant_ = 0, pupil_ = 1, vpupil_ = 0;
     float blush_amt_ = 0.6f, mouth_open_ = 0, pop_ = 0, vpop_ = 0;
     float cr_ = 255, cg_ = 190, cb_ = 70;
+    float head_tilt_ = 0;          // cute side tilt while chatting
     uint32_t t_ = 0;               // ticks
     uint32_t next_blink_ = 60, blink_t_ = 0, next_glance_ = 90;
     float glance_x_ = 0, glance_y_ = 0;
