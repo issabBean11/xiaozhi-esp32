@@ -387,7 +387,7 @@ void Face::DrawEye(Eye& e, int side, float cx, float cy) {
     uint32_t col_bot = Rgb(fminf(255, cr_ + 10), fminf(255, cg_ + 40), fminf(255, cb_ + 60));
 
     bool open = mode == OPEN;
-    Show(e.halo2, open || mode == STAR); Show(e.halo1, open); Show(e.iris, open);
+    Show(e.halo2, mode == STAR); Show(e.halo1, open); Show(e.iris, open);
     Show(e.pupil, open && blink > 0.3f); Show(e.hl1, open && blink > 0.3f); Show(e.hl2, open && blink > 0.3f); Show(e.hl3, open && blink > 0.3f);
     Show(e.arc, mode == HAPPY || mode == CLOSED || mode == SPIRAL);
     Show(e.l1, mode == XEYE || mode == HEART); Show(e.l2, mode == HEART);
@@ -396,7 +396,6 @@ void Face::DrawEye(Eye& e, int side, float cx, float cy) {
 
     float px = cx + lx_ * 0.45f, py = cy + ly_ * 0.45f;   // whole eye shifts a bit, pupil shifts more
     if (open) {
-        Box(e.halo2, px - W / 2 - 22, py - H / 2 - 22, W + 44, H + 44);
         Box(e.halo1, px - W / 2 - 11, py - H / 2 - 11, W + 22, H + 22); Color(e.halo1, col);
         Box(e.iris, px - W / 2, py - H / 2, W, H);
         Color(e.iris, col_top);
@@ -538,29 +537,27 @@ void Face::Tick() {
     // ---- wobble physics: the blob rolls with tilt and sloshes when shaken
     {
         static float vx = 0, vy = 0, sq = 0;
-        const float room_x = 240 - 255 * G_S - 4, room_y = 240 - 252 * G_S - 2;
+        // only her HEAD moves: it leans with tilt and bobbles fast when shaken; the body stays put
+        const float room_x = 46, room_y = 26;
         float tgx = 0, tgy = 0;
         if (g_imu_ok) {
-            tgx = fmaxf(-room_x, fminf(room_x, -g_tilt_y * 170));
-            tgy = fmaxf(-room_y, fminf(room_y, g_tilt_x * 140));
-            vx += -g_dyn_y * 22; vy += g_dyn_x * 22;
+            tgx = fmaxf(-room_x, fminf(room_x, -g_tilt_y * 70));
+            tgy = fmaxf(-room_y, fminf(room_y, g_tilt_x * 40));
+            vx += -g_dyn_y * 45; vy += g_dyn_x * 30;
         }
-        if (MOODS[mood_].eye == SPIRAL) { vx += (float)Rand(0, 12) - 6; vy += (float)Rand(0, 12) - 6; }
-        if (pop_ > 0.05f) vy -= pop_ * 6;                 // little hop on mood changes / pets
-        vx += (tgx - G_OX) * 0.07f; vy += (tgy - G_OY) * 0.07f;
-        vx *= 0.86f; vy *= 0.86f;
+        if (MOODS[mood_].eye == SPIRAL) { vx += (float)Rand(0, 20) - 10; vy += (float)Rand(0, 10) - 5; }
+        if (pop_ > 0.05f) vy -= pop_ * 10;                // little hop on mood changes / pets
+        vx += (tgx - G_OX) * 0.25f; vy += (tgy - G_OY) * 0.25f;
+        vx *= 0.74f; vy *= 0.74f;
         G_OX += vx; G_OY += vy;
         if (fabsf(G_OX) > room_x) { G_OX = copysignf(room_x, G_OX); sq = fminf(0.10f, fabsf(vx) * 0.015f); vx = -vx * 0.45f; }
         if (fabsf(G_OY) > room_y) { G_OY = copysignf(room_y, G_OY); sq = fminf(0.10f, fabsf(vy) * 0.015f); vy = -vy * 0.45f; }
-        if (fabsf(vx) < 0.05f && fabsf(vy) < 0.05f && fabsf(tgx - G_OX) < 0.4f && fabsf(tgy - G_OY) < 0.4f) { G_OX = tgx; G_OY = tgy; vx = vy = 0; }
+        if (fabsf(vx) < 0.3f && fabsf(vy) < 0.3f && fabsf(tgx - G_OX) < 0.8f && fabsf(tgy - G_OY) < 0.8f) { G_OX = tgx; G_OY = tgy; vx = vy = 0; }
         sq *= 0.8f;
         float speed = fminf(0.05f, sqrtf(vx * vx + vy * vy) * 0.004f);
-        float br = 2 * sinf(t_ * 0.07f);                       // breathing
-        float hw = 350 * (1 + sq + speed), hh = 320 * (1 - sq * 0.8f);   // head
-        float hy = 200 + (320 - hh) / 2 + br;
-        Box(s_body, 240 - hw / 2, hy - hh / 2, hw, hh);
-        Box(s_glow, 240 - hw / 2 - 7, hy - hh / 2 - 7, hw + 14, hh + 14);
-        float tw = 290 * (1 + sq * 0.5f), th2 = 190 + br * 2, ty0 = 410;   // sitting body
+        float br = 0;                                           // big shapes stay still (keeps the frame rate high)
+        float hox = G_OX, hoy = G_OY; G_OX = 0; G_OY = 0;       // body, paws and tail don't move
+        float tw = 290, th2 = 190, ty0 = 410;                   // sitting body
         Box(s_torso, 240 - tw / 2, ty0 - th2 / 2, tw, th2);
         Box(s_torso_glow, 240 - tw / 2 - 7, ty0 - th2 / 2 - 7, tw + 14, th2 + 14);
         for (int i = 0; i < 2; i++) {
@@ -572,13 +569,18 @@ void Face::Tick() {
         int a0 = 300 + (int)swish, a1 = 420 + (int)swish;      // tail curls up the right side
         ArcAt(s_tail_glow, 372, 400, 170, a0, a1);
         ArcAt(s_tail, 372, 400, 170, a0 + 3, a1 - 3);
+        G_OX = hox; G_OY = hoy;
+        float hw = 350 * (1 + sq + speed), hh = 320 * (1 - sq * 0.8f);   // head (moves)
+        float hy = 200 + (320 - hh) / 2;
+        Box(s_body, 240 - hw / 2, hy - hh / 2, hw, hh);
+        Box(s_glow, 240 - hw / 2 - 7, hy - hh / 2 - 7, hw + 14, hh + 14);
         float st = 18 + 5 * fabsf(sinf(t_ * 0.12f)) + ((MOODS[mood_].fx & SPARK) ? 6 : 0);   // forehead star
         Box(s_star[0], 240 - st * 0.22f, 92 + br - st, st * 0.44f, st * 2);
         Box(s_star[1], 240 - st, 92 + br - st * 0.22f, st * 2, st * 0.44f);
     }
 
     float bob = speaking ? 4 * fabsf(sinf(t_ * 0.45f)) : 0;
-    float breathe = 4 * sinf(t_ * 0.07f) - bob;
+    float breathe = 3 * sinf(t_ * 0.07f) - bob;
     float cy = 200 + breathe;
     DrawEye(eye_[0], -1, 240 - 84, cy);
     DrawEye(eye_[1], +1, 240 + 84, cy);
@@ -594,7 +596,7 @@ void Face::Tick() {
 
     // blush + anime hatch lines
     for (int s = 0; s < 2; s++) {
-        float bx = s ? 350 : 130, by = 286 + breathe * 0.5f;
+        float bx = s ? 350 : 130, by = 286;
         float bw = 74 + 10 * fminf(1, blush_amt_ - 1);
         Box(blush_[s], bx - bw / 2, by - 15, bw, 30);
         lv_opa_t op = (lv_opa_t)fminf(255, 40 + blush_amt_ * 100);
@@ -609,7 +611,7 @@ void Face::Tick() {
 
     // mouth
     MouthMode mm = m.mouth;
-    float my = 304 + breathe * 0.6f;
+    float my = 304 - bob * 0.5f;
     float open_amt = 0;
     if (speaking) {
         open_amt = 0.15f + 0.85f * fabsf(sinf(t_ * 0.85f) * sinf(t_ * 0.23f + 1.0f));
