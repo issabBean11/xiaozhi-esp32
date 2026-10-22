@@ -329,6 +329,18 @@ private:
                                EnterWifiConfigMode();
                                return true;
                            });
+        // Bean Bean: change her fur color by voice ("be a white kitty")
+        mcp_server.AddTool("self.bean.set_fur_color",
+                           "Change Bean Bean's fur color on her screen. color must be one of: black, white, pink.",
+                           PropertyList({Property("color", kPropertyTypeString)}),
+                           [](const PropertyList& properties) -> ReturnValue {
+                               auto c = properties["color"].value<std::string>();
+                               int t = c.find("white") != std::string::npos ? 1 : c.find("pink") != std::string::npos ? 2 : 0;
+                               bean::SetFurTheme(t);
+                               Settings bean_settings("bean", true);
+                               bean_settings.SetInt("fur", t);
+                               return true;
+                           });
         // Bean Bean: wireless self-update from her GitHub (keeps Wi-Fi and settings)
         mcp_server.AddTool("self.bean.update_software",
                            "Download and install the newest Bean Bean software over Wi-Fi, then restart. "
@@ -348,6 +360,10 @@ public:
         InitializePowerSaveTimer();
         InitializeCodecI2c();
         bean::StartImu(i2c_bus_);
+        {
+            Settings bean_settings("bean", false);
+            bean::SetFurTheme(bean_settings.GetInt("fur", 0));   // black kitty unless she was told otherwise
+        }
         {
             // Bean Bean is loud by default (once); the user can still change it by voice
             Settings audio("audio", true);
