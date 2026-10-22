@@ -329,6 +329,18 @@ private:
                                EnterWifiConfigMode();
                                return true;
                            });
+        // Bean Bean: wireless self-update from her GitHub (keeps Wi-Fi and settings)
+        mcp_server.AddTool("self.bean.update_software",
+                           "Download and install the newest Bean Bean software over Wi-Fi, then restart. "
+                           "Use when the user asks Bean Bean to update herself or get her new software. "
+                           "Tell the user first that you will restart in about a minute.",
+                           PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                               auto& app = Application::GetInstance();
+                               app.Schedule([&app]() {
+                                   app.UpgradeFirmware("https://raw.githubusercontent.com/issabBean11/xiaozhi-esp32/firmware/beanbean_c6_ota.bin", "Bean Bean latest");
+                               });
+                               return std::string("Updating now. I will restart by myself when it is done.");
+                           });
     }
 
 public:
