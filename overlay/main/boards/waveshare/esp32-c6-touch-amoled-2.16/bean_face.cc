@@ -19,6 +19,9 @@ namespace bean {
 // ----------------------------------------------------------------------------- motion sensor
 static std::atomic<bool> g_imu_ok{false};
 static std::atomic<bool> g_shaken{false};
+static std::atomic<bool> g_lifted{false};
+static std::atomic<bool> g_upside{false};
+static std::atomic<int64_t> g_last_motion{0};
 static volatile float g_tilt_x = 0, g_tilt_y = 0;
 
 static void ImuTask(void* arg) {
@@ -32,6 +35,8 @@ static void ImuTask(void* arg) {
     int64_t spikes[4] = {0, 0, 0, 0};
     int spike_i = 0;
     int64_t last_spike = 0;
+    float bx = 0, by = 0, bz = 0;          // resting "upright" gravity, learned at start
+    int settle = 0, calm = 0, busy = 0;
     while (true) {
         uint8_t reg = 0x35, d[6];
         if (i2c_master_transmit_receive(dev, &reg, 1, d, 6, 50) == ESP_OK) {
@@ -39,9 +44,22 @@ static void ImuTask(void* arg) {
             float ay = (int16_t)(d[2] | d[3] << 8) / 8192.0f;
             float az = (int16_t)(d[4] | d[5] << 8) / 8192.0f;
             gx = gx * 0.85f + ax * 0.15f; gy = gy * 0.85f + ay * 0.15f; gz = gz * 0.85f + az * 0.15f;
-            g_tilt_x = gx; g_tilt_y = gy;
             float mag = sqrtf(ax * ax + ay * ay + az * az);
             int64_t now = esp_timer_get_time();
+            float dev = fabsf(mag - 1.0f);
+            if (settle < 25) {                     // first second: learn how she normally stands
+                bx += ax / 25; by += ay / 25; bz += az / 25; settle++;
+            } else {
+                // tilt relative to her normal pose
+                g_tilt_x = gx - bx; g_tilt_y = gy - by;
+                // upside down: gravity points the opposite way from normal
+                float gn = sqrtf(gx * gx + gy * gy + gz * gz) + 1e-3f;
+                float dot = (gx * bx + gy * by + gz * bz) / gn;
+                g_upside = dot < -0.55f;
+                // picked up: a gentle lift after sitting still
+                if (dev > 0.08f) { g_last_motion = now; busy++; calm = 0; } else { calm++; if (calm > 10) busy = 0; }
+                if (busy == 4 && dev < 0.9f && calm == 0) g_lifted = true;
+            }
             if (fabsf(mag - 1.0f) > 0.9f && now - last_spike > 90000) {
                 last_spike = now;
                 spikes[spike_i++ & 3] = now;
@@ -361,13 +379,40 @@ void Face::Tick() {
     t_++;
     int pm = pending_mood_.exchange(-1);
     if (pm >= 0 && pm != base_mood_) { base_mood_ = pm; vpop_ += 0.10f; }
-    if (pending_poke_.exchange(false)) { mood_ = MoodIndex("petted"); mood_until_ = t_ + 50; vpop_ += 0.14f; }
-    if (g_shaken.exchange(false)) { mood_ = MoodIndex("dizzy"); mood_until_ = t_ + 85; vpop_ += 0.2f; }
+    auto state0 = Application::GetInstance().GetDeviceState();
+    bool idle0 = state0 == kDeviceStateIdle;
+    static uint32_t last_voice = 0, last_active = 0;
+    auto voice = [&](const char* what) {   // let her react out loud (not too often)
+        if (idle0 && (last_voice == 0 || t_ - last_voice > 1500)) {   // ~50 s cooldown
+            last_voice = t_;
+            Application::GetInstance().WakeWordInvoke(what);
+        }
+    };
+    if (!idle0 || esp_timer_get_time() - g_last_motion < 1500000) last_active = t_;
+    if (pending_poke_.exchange(false)) {
+        mood_ = MoodIndex("petted"); mood_until_ = t_ + 50; vpop_ += 0.14f; last_active = t_;
+        voice("Bean bean is petting your head! React happy and purry in one tiny sentence.");
+    }
+    if (g_shaken.exchange(false)) {
+        mood_ = MoodIndex("dizzy"); mood_until_ = t_ + 85; vpop_ += 0.2f; last_active = t_;
+        voice("Bean bean just shook you really hard! React dizzy and silly in one tiny sentence.");
+    }
+    if (g_lifted.exchange(false) && !mood_until_) {
+        mood_ = MoodIndex("surprised"); mood_until_ = t_ + 30; vpop_ += 0.15f; last_active = t_;
+    }
+    if (g_upside.load()) { mood_ = MoodIndex("shocked"); mood_until_ = t_ + 5; last_active = t_; }
     if (mood_until_ && t_ >= mood_until_) {
         if (MOODS[mood_].eye == SPIRAL) { mood_ = MoodIndex("laughing"); mood_until_ = t_ + 40; }
         else mood_until_ = 0;
     }
-    if (!mood_until_) mood_ = base_mood_;
+    if (!mood_until_) {
+        mood_ = base_mood_;
+        uint32_t quiet = t_ - last_active;
+        if (idle0 && base_mood_ == 0) {
+            if (quiet > 5400) mood_ = MoodIndex("relaxed");        // ~3 min: dozing
+            else if (quiet > 2700) mood_ = MoodIndex("sleepy");    // ~1.5 min: getting sleepy
+        }
+    }
     const Mood& m = MOODS[mood_];
 
     auto state = Application::GetInstance().GetDeviceState();
