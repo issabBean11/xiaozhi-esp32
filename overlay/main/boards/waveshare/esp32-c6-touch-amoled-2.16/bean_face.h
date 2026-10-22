@@ -11,6 +11,10 @@ namespace bean {
 // Start the motion sensor (QMI8658) on the shared I2C bus. Safe if the chip is missing.
 void StartImu(i2c_master_bus_handle_t bus);
 
+// Fur color: 0 = black, 1 = white, 2 = pastel pink (any thread)
+void SetFurTheme(int theme);
+int GetFurTheme();
+
 class Face {
 public:
     void Create(lv_obj_t* parent);          // call with the display lock held
