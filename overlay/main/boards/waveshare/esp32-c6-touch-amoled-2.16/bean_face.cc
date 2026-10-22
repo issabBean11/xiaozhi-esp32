@@ -146,6 +146,37 @@ static lv_obj_t *s_glow, *s_body, *s_earf[2], *s_eari[2];
 static lv_obj_t *s_torso_glow, *s_torso, *s_tail_glow, *s_tail, *s_paw_glow[2], *s_paw[2], *s_star[2];
 static lv_point_precise_t s_earf_pts[2][3], s_eari_pts[2][3];
 
+// ----------------------------------------------------------------------------- yarn toy + focus timer
+// Secret: double-click the button and a yarn ball drops in. It rolls with tilt, she watches and chases it,
+// and tapping the screen makes her swat it. Double-click again to put it away.
+static std::atomic<bool> g_yarn_toggle{false};
+static bool s_yarn_on = false;
+static float s_yx = 360, s_yy = 380, s_yvx = 0, s_yvy = 0, s_yrot = 0, s_ytail = 2.4f;
+static const float YARN_R = 34;
+static lv_obj_t *s_yarn = nullptr, *s_yarn_a[3] = {nullptr, nullptr, nullptr}, *s_yarn_str = nullptr;
+static lv_point_precise_t s_yarn_str_pts[3];
+// Focus / break timer: a glowing ring around the screen that slowly empties.
+static std::atomic<int64_t> g_timer_end{0};
+static std::atomic<int> g_timer_total{1};
+static std::atomic<bool> g_timer_rest{false};
+static lv_obj_t *s_ring = nullptr, *s_ring_lbl = nullptr;
+
+void ToggleYarn() { g_yarn_toggle = true; }
+void StartTimer(int minutes, bool rest) {
+    if (minutes < 1) minutes = 1;
+    if (minutes > 180) minutes = 180;
+    g_timer_rest = rest;
+    g_timer_total = minutes * 60;
+    g_timer_end = esp_timer_get_time() + (int64_t)minutes * 60 * 1000000;
+}
+void StopTimer() { g_timer_end = 0; }
+int TimerSecondsLeft() {
+    int64_t end = g_timer_end.load();
+    if (!end) return 0;
+    int64_t left = (end - esp_timer_get_time()) / 1000000;
+    return left > 0 ? (int)left : 0;
+}
+
 // Fur themes: 0 = black kitty, 1 = white kitty, 2 = pastel pink kitty
 struct Theme { uint32_t fur, rim, ear_in, mouth, line_eye, blush, text; };
 static const Theme THEMES[3] = {
@@ -220,13 +251,23 @@ static void Box(lv_obj_t* o, float x, float y, float w, float h) {
     if (lv_obj_get_style_width(o, LV_PART_MAIN) != iw || lv_obj_get_style_height(o, LV_PART_MAIN) != ih) lv_obj_set_size(o, iw, ih);
 }
 static void Circle(lv_obj_t* o, float cx, float cy, float d) { Box(o, cx - d / 2, cy - d / 2, d, d); }
-static void Line(lv_obj_t* l, lv_point_precise_t* store, const float* xy, int n) {
+static void LineAbs(lv_obj_t* l, lv_point_precise_t* store, const float* sx, const float* sy, int n) {
+    // the line object sits at the top-left of its own points, so moving it only redraws a small area
+    float mx = sx[0], my = sy[0];
+    for (int i = 1; i < n; i++) { mx = fminf(mx, sx[i]); my = fminf(my, sy[i]); }
+    int ox = lroundf(mx), oy = lroundf(my);
+    if (lv_obj_get_style_x(l, LV_PART_MAIN) != ox || lv_obj_get_style_y(l, LV_PART_MAIN) != oy) lv_obj_set_pos(l, ox, oy);
     bool diff = false;
     for (int i = 0; i < n; i++) {
-        lv_value_precise_t x = lroundf(TX(xy[i * 2])), y = lroundf(TY(xy[i * 2 + 1]));
+        lv_value_precise_t x = lroundf(sx[i]) - ox, y = lroundf(sy[i]) - oy;
         if (store[i].x != x || store[i].y != y) { store[i].x = x; store[i].y = y; diff = true; }
     }
     if (diff || lv_line_get_point_count(l) != (uint32_t)n) lv_line_set_points(l, store, n);
+}
+static void Line(lv_obj_t* l, lv_point_precise_t* store, const float* xy, int n) {
+    float sx[4], sy[4];
+    for (int i = 0; i < n && i < 4; i++) { sx[i] = TX(xy[i * 2]); sy[i] = TY(xy[i * 2 + 1]); }
+    LineAbs(l, store, sx, sy, n < 4 ? n : 4);
 }
 static void ArcAt(lv_obj_t* a, float cx, float cy, float d, int a0, int a1) {
     Circle(a, cx, cy, d);
@@ -284,6 +325,24 @@ void Face::Create(lv_obj_t* parent) {
     lv_obj_add_flag(root_, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(root_, ClickCb, LV_EVENT_CLICKED, this);
 
+    s_ring = lv_arc_create(root_);
+    lv_obj_remove_style(s_ring, nullptr, LV_PART_KNOB);
+    lv_obj_remove_flag(s_ring, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(s_ring, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(s_ring, 0, 0);
+    lv_obj_set_style_arc_width(s_ring, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_ring, lv_color_hex(0x2A2238), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_ring, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(s_ring, true, LV_PART_INDICATOR);
+    lv_obj_set_size(s_ring, 464, 464);
+    lv_obj_set_pos(s_ring, 8, 8);
+    lv_arc_set_bg_angles(s_ring, 0, 360);
+    lv_arc_set_rotation(s_ring, 270);
+    lv_arc_set_angles(s_ring, 0, 360);
+    lv_obj_add_flag(s_ring, LV_OBJ_FLAG_HIDDEN);
+    s_ring_lbl = Text(root_, "", 0xFFBE46);
+    lv_obj_align(s_ring_lbl, LV_ALIGN_TOP_MID, 0, 28);
+
     s_tail_glow = Curve(root_, RIMC, 40);
     s_tail = Curve(root_, FUR, 28);
     s_torso_glow = Blob(root_, RIMC);
@@ -327,6 +386,32 @@ void Face::Create(lv_obj_t* parent) {
     bang_ = Text(root_, "!", 0xFF5064);
 
     Show(ear_l_, true); Show(ear_r_, true); Show(blush_[0], true); Show(blush_[1], true);
+    s_yarn_str = lv_line_create(root_);
+    lv_obj_set_style_line_width(s_yarn_str, 4, 0);
+    lv_obj_set_style_line_color(s_yarn_str, lv_color_hex(0xFF8DB6), 0);
+    lv_obj_set_style_line_rounded(s_yarn_str, true, 0);
+    lv_obj_remove_flag(s_yarn_str, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_yarn_str, LV_OBJ_FLAG_HIDDEN);
+    s_yarn = Blob(root_, 0xFF8DB6);
+    lv_obj_set_style_border_width(s_yarn, 3, 0);
+    lv_obj_set_style_border_color(s_yarn, lv_color_hex(0xE0457E), 0);
+    lv_obj_set_size(s_yarn, YARN_R * 2, YARN_R * 2);
+    static const int YA[3][3] = {{8, 8, 52}, {18, 18, 32}, {14, 26, 22}};   // x, y, size of the wound-yarn swirls
+    for (int i = 0; i < 3; i++) {
+        s_yarn_a[i] = lv_arc_create(s_yarn);
+        lv_obj_remove_style(s_yarn_a[i], nullptr, LV_PART_KNOB);
+        lv_obj_remove_flag(s_yarn_a[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_bg_opa(s_yarn_a[i], LV_OPA_TRANSP, 0);
+        lv_obj_set_style_pad_all(s_yarn_a[i], 0, 0);
+        lv_obj_set_style_arc_opa(s_yarn_a[i], LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(s_yarn_a[i], 3, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(s_yarn_a[i], lv_color_hex(i == 1 ? 0xE0457E : 0xFFD3E4), LV_PART_INDICATOR);
+        lv_obj_set_style_arc_rounded(s_yarn_a[i], true, LV_PART_INDICATOR);
+        lv_arc_set_bg_angles(s_yarn_a[i], 0, 360);
+        lv_arc_set_angles(s_yarn_a[i], 200, 340);
+        lv_obj_set_pos(s_yarn_a[i], YA[i][0], YA[i][1]);
+        lv_obj_set_size(s_yarn_a[i], YA[i][2], YA[i][2]);
+    }
     if (g_pending_theme.load() < 0) g_pending_theme = g_theme;
     lv_timer_create(TickCb, 33, this);
 }
@@ -467,16 +552,74 @@ void Face::Tick() {
     auto state0 = Application::GetInstance().GetDeviceState();
     bool idle0 = state0 == kDeviceStateIdle;
     static uint32_t last_voice = 0, last_active = 0;
-    auto voice = [&](const char* what) {   // let her react out loud (not too often)
-        if (idle0 && (last_voice == 0 || t_ - last_voice > 1500)) {   // ~50 s cooldown
+    auto voice = [&](const char* what, bool force = false) {   // let her react out loud (not too often)
+        if (idle0 && (force || last_voice == 0 || t_ - last_voice > 1500)) {   // ~50 s cooldown
             last_voice = t_;
             Application::GetInstance().WakeWordInvoke(what);
+            return true;
         }
+        return false;
     };
     if (!idle0 || esp_timer_get_time() - g_last_motion < 1500000) last_active = t_;
     if (pending_poke_.exchange(false)) {
-        mood_ = MoodIndex("petted"); mood_until_ = t_ + 50; vpop_ += 0.14f; last_active = t_;
-        voice("Bean bean is petting your head! React happy and purry in one tiny sentence.");
+        if (s_yarn_on) {   // swat the yarn ball away from her face
+            float dx = s_yx - TX(240), dy = s_yy - TY(220), d = sqrtf(dx * dx + dy * dy) + 1;
+            s_yvx += dx / d * 18 + (float)Rand(0, 6) - 3; s_yvy += dy / d * 18 - 5;
+            mood_ = MoodIndex("happy"); mood_until_ = t_ + 25; vpop_ += 0.12f; last_active = t_;
+        } else {
+            mood_ = MoodIndex("petted"); mood_until_ = t_ + 50; vpop_ += 0.14f; last_active = t_;
+            voice("Bean bean is petting your head! React happy and purry in one tiny sentence.");
+        }
+    }
+    static bool yarn_shout = false;
+    if (g_yarn_toggle.exchange(false)) {
+        s_yarn_on = !s_yarn_on;
+        Show(s_yarn, s_yarn_on); Show(s_yarn_str, s_yarn_on);
+        last_active = t_;
+        if (s_yarn_on) {   // drops in from the top and bounces
+            s_yx = Rand(0, 1) ? 150 : 330; s_yy = 50; s_yvx = (float)Rand(0, 8) - 4; s_yvy = 9;
+            mood_ = MoodIndex("surprised"); mood_until_ = t_ + 30; vpop_ += 0.25f;
+            yarn_shout = true;
+        } else {
+            mood_ = MoodIndex("happy"); mood_until_ = t_ + 30;
+            yarn_shout = false;
+        }
+    }
+    if (yarn_shout && voice("Bean bean found your secret easter egg and a yarn ball just dropped onto your screen! "
+                            "Shout exactly: YARN TIME! Then add one tiny excited kitty sentence.", true)) yarn_shout = false;
+
+    // focus / break timer
+    static int timer_done = 0;   // 1 = focus finished, 2 = break finished (waiting to say it out loud)
+    {
+        static bool ring_on = false;
+        static int last_deg = -1, last_sec = -1;
+        int64_t end = g_timer_end.load();
+        if (end) {
+            int left = (int)((end - esp_timer_get_time()) / 1000000);
+            if (left <= 0) {
+                if (g_timer_end.compare_exchange_strong(end, 0)) timer_done = g_timer_rest ? 2 : 1;
+            } else {
+                if (!ring_on) {
+                    ring_on = true; last_deg = -1; last_sec = -1;
+                    uint32_t c = g_timer_rest ? 0xB9A6FF : 0xFFBE46;
+                    lv_obj_set_style_arc_color(s_ring, lv_color_hex(c), LV_PART_INDICATOR);
+                    lv_obj_set_style_text_color(s_ring_lbl, lv_color_hex(c), 0);
+                    Show(s_ring, true); Show(s_ring_lbl, true);
+                }
+                int total = g_timer_total.load();
+                int deg = 360 * left / (total > 0 ? total : 1);
+                if (deg != last_deg) { lv_arc_set_angles(s_ring, 0, deg < 2 ? 2 : deg); last_deg = deg; }
+                if (left != last_sec) { lv_label_set_text_fmt(s_ring_lbl, "%d:%02d", left / 60, left % 60); last_sec = left; }
+                if (!g_timer_rest) last_active = t_;   // body-doubling: she stays awake with you
+            }
+        }
+        if (!g_timer_end.load() && ring_on) { ring_on = false; Show(s_ring, false); Show(s_ring_lbl, false); }
+    }
+    if (timer_done) {
+        const char* say = timer_done == 1
+            ? "Bean bean's focus timer just finished! Cheer for her in one tiny sentence, then ask her to stand up, stretch and drink water, and offer a 5 minute break timer."
+            : "Bean bean's break timer just finished. Gently and kindly invite her back in one tiny sentence, with just one tiny first step.";
+        if (voice(say, true)) { mood_ = MoodIndex(timer_done == 1 ? "confident" : "happy"); mood_until_ = t_ + 60; vpop_ += 0.2f; timer_done = 0; }
     }
     if (g_shaken.exchange(false)) {
         mood_ = MoodIndex("dizzy"); mood_until_ = t_ + 85; vpop_ += 0.2f; last_active = t_;
@@ -522,7 +665,37 @@ void Face::Tick() {
     }
     float tx = m.lx, ty = m.ly;
     if (m.lx == 0 && m.ly == 0 && !speaking) { tx = glance_x_; ty = glance_y_; }
-    if (g_imu_ok && (fabsf(g_tilt_x) > 0.15f || fabsf(g_tilt_y) > 0.15f)) {
+    if (s_yarn_on) {
+        if (g_imu_ok) { s_yvx += -g_tilt_y * 1.8f - g_dyn_y * 8; s_yvy += g_tilt_x * 1.8f + g_dyn_x * 8; }
+        else if (Rand(0, 90) == 0) { s_yvx += (float)Rand(0, 10) - 5; s_yvy += (float)Rand(0, 10) - 5; }
+        float sp = sqrtf(s_yvx * s_yvx + s_yvy * s_yvy);
+        if (sp > 26) { s_yvx *= 26 / sp; s_yvy *= 26 / sp; }
+        s_yvx *= 0.965f; s_yvy *= 0.965f;
+        s_yx += s_yvx; s_yy += s_yvy;
+        const float lo = 14 + YARN_R, hi = 480 - 14 - YARN_R;
+        if (s_yx < lo) { s_yx = lo; s_yvx = fabsf(s_yvx) * 0.6f; }
+        if (s_yx > hi) { s_yx = hi; s_yvx = -fabsf(s_yvx) * 0.6f; }
+        if (s_yy < lo) { s_yy = lo; s_yvy = fabsf(s_yvy) * 0.6f; }
+        if (s_yy > hi) { s_yy = hi; s_yvy = -fabsf(s_yvy) * 0.6f; }
+        s_yrot += s_yvx * 2.2f + s_yvy * 0.8f;
+        BoxRaw(s_yarn, s_yx - YARN_R, s_yy - YARN_R, YARN_R * 2, YARN_R * 2);
+        int rot = ((int)s_yrot % 360 + 360) % 360;
+        for (int i = 0; i < 3; i++) {
+            int r = (rot * (i == 1 ? 2 : 1) + i * 120) % 360;
+            if (lv_arc_get_rotation(s_yarn_a[i]) != r) lv_arc_set_rotation(s_yarn_a[i], r);
+        }
+        if (sp > 0.6f) s_ytail = atan2f(-s_yvy, -s_yvx);   // the loose string trails behind
+        float ca = cosf(s_ytail), sa = sinf(s_ytail), w = 6 * sinf(t_ * 0.3f);
+        float px[3] = {s_yx + ca * (YARN_R - 2), s_yx + ca * (YARN_R + 16) - sa * w, s_yx + ca * (YARN_R + 30) + sa * w};
+        float py[3] = {s_yy + sa * (YARN_R - 2), s_yy + sa * (YARN_R + 16) + ca * w, s_yy + sa * (YARN_R + 30) - ca * w};
+        LineAbs(s_yarn_str, s_yarn_str_pts, px, py, 3);
+        if (!speaking) {   // she watches it
+            tx = fmaxf(-30, fminf(30, (s_yx - TX(240)) * 0.15f));
+            ty = fmaxf(-20, fminf(20, (s_yy - TY(200)) * 0.12f));
+        }
+    }
+    bool chatting = speaking || listening;
+    if (!chatting && !s_yarn_on && g_imu_ok && (fabsf(g_tilt_x) > 0.15f || fabsf(g_tilt_y) > 0.15f)) {
         tx = fmaxf(-30, fminf(30, -g_tilt_y * 45)); ty = fmaxf(-20, fminf(20, g_tilt_x * 35));
     }
     Spring(lx_, vlx_, tx, 0.14f, 0.32f); Spring(ly_, vly_, ty, 0.14f, 0.32f);
@@ -538,14 +711,36 @@ void Face::Tick() {
     {
         static float vx = 0, vy = 0, sq = 0;
         // only her HEAD moves: it leans with tilt and bobbles fast when shaken; the body stays put
-        const float room_x = 46, room_y = 26;
+        const float room_x = chatting ? 1 : 120, room_y = chatting ? 1 : 95;
         float tgx = 0, tgy = 0;
-        if (g_imu_ok) {
-            tgx = fmaxf(-room_x, fminf(room_x, -g_tilt_y * 70));
-            tgy = fmaxf(-room_y, fminf(room_y, g_tilt_x * 40));
-            vx += -g_dyn_y * 45; vy += g_dyn_x * 30;
+        // STANDBY: only her eyes + face float around the screen (light and fast), drifting gently,
+        //          following tilt and bobbling when shaken.
+        // CHATTING: her whole kitty body appears, sitting still in the middle; only the tail wags.
+        static bool shown_full = true;
+        if (chatting != shown_full) {
+            shown_full = chatting;
+            lv_obj_t* body_parts[] = {s_glow, s_body, s_earf[0], s_earf[1], s_eari[0], s_eari[1], ear_l_, ear_r_,
+                                      s_star[0], s_star[1], s_torso_glow, s_torso, s_paw_glow[0], s_paw_glow[1],
+                                      s_paw[0], s_paw[1], s_tail_glow, s_tail};
+            for (lv_obj_t* o : body_parts) Show(o, chatting);
+            uint32_t lid_col = chatting ? FUR : 0x000000;            // eyelids blend into fur or into the black screen
+            for (auto& e : eye_) lv_obj_set_style_line_color(e.lid, lv_color_hex(lid_col), 0);
         }
-        if (MOODS[mood_].eye == SPIRAL) { vx += (float)Rand(0, 20) - 10; vy += (float)Rand(0, 10) - 5; }
+        float rx = chatting ? 0 : 120, ry = chatting ? 0 : 95;
+        if (!chatting) {
+            tgx = 40 * sinf(t_ * 0.011f); tgy = 22 * sinf(t_ * 0.017f + 1.0f);     // gentle wander
+            if (s_yarn_on) {                                                        // chase the yarn ball!
+                tgx = (s_yx - 240) * 0.35f; tgy = (s_yy - 250) * 0.3f;
+            }
+            if (g_imu_ok) {
+                tgx = fmaxf(-rx, fminf(rx, tgx - g_tilt_y * 160));
+                tgy = fmaxf(-ry, fminf(ry, tgy + g_tilt_x * 120));
+                vx += -g_dyn_y * 45; vy += g_dyn_x * 35;
+            }
+            tgx = fmaxf(-rx, fminf(rx, tgx)); tgy = fmaxf(-ry, fminf(ry, tgy));
+            if (MOODS[mood_].eye == SPIRAL) { vx += (float)Rand(0, 20) - 10; vy += (float)Rand(0, 14) - 7; }
+        }
+        head_tilt_ = 0;
         if (pop_ > 0.05f) vy -= pop_ * 10;                // little hop on mood changes / pets
         vx += (tgx - G_OX) * 0.25f; vy += (tgy - G_OY) * 0.25f;
         vx *= 0.74f; vy *= 0.74f;
@@ -557,6 +752,7 @@ void Face::Tick() {
         float speed = fminf(0.05f, sqrtf(vx * vx + vy * vy) * 0.004f);
         float br = 0;                                           // big shapes stay still (keeps the frame rate high)
         float hox = G_OX, hoy = G_OY; G_OX = 0; G_OY = 0;       // body, paws and tail don't move
+        if (chatting) {
         float tw = 290, th2 = 190, ty0 = 410;                   // sitting body
         Box(s_torso, 240 - tw / 2, ty0 - th2 / 2, tw, th2);
         Box(s_torso_glow, 240 - tw / 2 - 7, ty0 - th2 / 2 - 7, tw + 14, th2 + 14);
@@ -565,15 +761,19 @@ void Face::Tick() {
             Box(s_paw[i], px - 40, py - 26, 80, 52);
             Box(s_paw_glow[i], px - 46, py - 32, 92, 64);
         }
-        float swish = ((MOODS[mood_].fx & EARWIG) || MOODS[mood_].eye == SPIRAL) ? 26 * sinf(t_ * 0.35f) : 12 * sinf(t_ * 0.08f);
+        float swish = chatting ? 24 * sinf(t_ * 0.3f)
+                    : ((MOODS[mood_].fx & EARWIG) || MOODS[mood_].eye == SPIRAL) ? 26 * sinf(t_ * 0.35f) : 12 * sinf(t_ * 0.08f);
         int a0 = 300 + (int)swish, a1 = 420 + (int)swish;      // tail curls up the right side
         ArcAt(s_tail_glow, 372, 400, 170, a0, a1);
         ArcAt(s_tail, 372, 400, 170, a0 + 3, a1 - 3);
+        }
         G_OX = hox; G_OY = hoy;
         float hw = 350 * (1 + sq + speed), hh = 320 * (1 - sq * 0.8f);   // head (moves)
         float hy = 200 + (320 - hh) / 2;
-        Box(s_body, 240 - hw / 2, hy - hh / 2, hw, hh);
-        Box(s_glow, 240 - hw / 2 - 7, hy - hh / 2 - 7, hw + 14, hh + 14);
+        if (chatting) {
+            Box(s_body, 240 - hw / 2, hy - hh / 2, hw, hh);
+            Box(s_glow, 240 - hw / 2 - 7, hy - hh / 2 - 7, hw + 14, hh + 14);
+        }
         float st = 18 + 5 * fabsf(sinf(t_ * 0.12f)) + ((MOODS[mood_].fx & SPARK) ? 6 : 0);   // forehead star
         Box(s_star[0], 240 - st * 0.22f, 92 + br - st, st * 0.44f, st * 2);
         Box(s_star[1], 240 - st, 92 + br - st * 0.22f, st * 2, st * 0.44f);
@@ -582,15 +782,16 @@ void Face::Tick() {
     float bob = speaking ? 4 * fabsf(sinf(t_ * 0.45f)) : 0;
     float breathe = 3 * sinf(t_ * 0.07f) - bob;
     float cy = 200 + breathe;
-    DrawEye(eye_[0], -1, 240 - 84, cy);
-    DrawEye(eye_[1], +1, 240 + 84, cy);
+    DrawEye(eye_[0], -1, 240 - 84, cy + head_tilt_ * 0.35f);
+    DrawEye(eye_[1], +1, 240 + 84, cy - head_tilt_ * 0.35f);
 
     // ears (wiggle when happy)
     float wig = (m.fx & EARWIG) ? 6 * sinf(t_ * 0.6f) : ((t_ % 160) < 8 ? 3 * sinf(t_ * 1.2f) : 0);
-    float ef[2][6] = {{96, 130, 96 - wig, 0 + fabsf(wig), 182, 66}, {384, 130, 384 + wig, 0 + fabsf(wig), 298, 66}};
+    float tl = head_tilt_ * 0.6f;
+    float ef[2][6] = {{96, 130 + tl, 96 - wig, 0 + fabsf(wig) + tl, 182, 66 + tl}, {384, 130 - tl, 384 + wig, 0 + fabsf(wig) - tl, 298, 66 - tl}};
     for (int i = 0; i < 2; i++) { Line(s_earf[i], s_earf_pts[i], ef[i], 3); Line(s_eari[i], s_eari_pts[i], ef[i], 3); }
-    float el[6] = {112, 112, 108 - wig, 30 + fabsf(wig), 160, 80};
-    float er[6] = {368, 112, 372 + wig, 30 + fabsf(wig), 320, 80};
+    float el[6] = {112, 112 + tl, 108 - wig, 30 + fabsf(wig) + tl, 160, 80 + tl};
+    float er[6] = {368, 112 - tl, 372 + wig, 30 + fabsf(wig) - tl, 320, 80 - tl};
     Line(ear_l_, ear_l_pts_, el, 3);
     Line(ear_r_, ear_r_pts_, er, 3);
 
