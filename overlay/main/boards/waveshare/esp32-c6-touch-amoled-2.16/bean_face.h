@@ -15,6 +15,13 @@ void StartImu(i2c_master_bus_handle_t bus);
 void SetFurTheme(int theme);
 int GetFurTheme();
 
+// Easter egg: yarn ball toy on/off (double-click the button)
+void ToggleYarn();
+// Focus / rest timer with a glowing ring around the screen (any thread)
+void StartTimer(int minutes, bool rest);
+void StopTimer();
+int TimerSecondsLeft();
+
 class Face {
 public:
     void Create(lv_obj_t* parent);          // call with the display lock held
