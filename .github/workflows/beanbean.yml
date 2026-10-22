@@ -1,0 +1,54 @@
+name: Bean Bean firmware
+
+on:
+  push:
+    branches: [main]
+    paths: ['overlay/**', '.github/workflows/beanbean.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.2
+    steps:
+      - name: Get Bean Bean changes
+        uses: actions/checkout@v4
+        with:
+          path: bean
+
+      - name: Get XiaoZhi v2.4.2 (the version that runs well on the C6)
+        uses: actions/checkout@v4
+        with:
+          repository: 78/xiaozhi-esp32
+          ref: v2.4.2
+          path: src
+
+      - name: Add Bean Bean's face, motion sensor and loud voice
+        run: cp -rv bean/overlay/. src/
+
+      - name: Build for Waveshare ESP32-C6 Touch AMOLED 2.16 (English)
+        shell: bash
+        run: |
+          cd src
+          source $IDF_PATH/export.sh
+          python scripts/build.py waveshare/esp32-c6-touch-amoled-2.16 --name esp32-c6-touch-amoled-2.16 --language en-US
+          cp build/merged-binary.bin ../beanbean_c6_firmware.bin
+
+      - name: Keep the firmware file
+        uses: actions/upload-artifact@v4
+        with:
+          name: beanbean_c6_firmware
+          path: beanbean_c6_firmware.bin
+
+      - name: Publish as the latest Bean Bean release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beanbean-latest
+          name: Bean Bean latest firmware
+          target_commitish: ${{ github.sha }}
+          files: beanbean_c6_firmware.bin
+          make_latest: true
