@@ -23,6 +23,7 @@ static std::atomic<bool> g_lifted{false};
 static std::atomic<bool> g_upside{false};
 static std::atomic<int64_t> g_last_motion{0};
 static volatile float g_tilt_x = 0, g_tilt_y = 0;
+static volatile float g_dyn_x = 0, g_dyn_y = 0;   // quick jolts (for wobble)
 
 static void ImuTask(void* arg) {
     auto dev = (i2c_master_dev_handle_t)arg;
@@ -52,6 +53,7 @@ static void ImuTask(void* arg) {
             } else {
                 // tilt relative to her normal pose
                 g_tilt_x = gx - bx; g_tilt_y = gy - by;
+                g_dyn_x = ax - gx; g_dyn_y = ay - gy;
                 // upside down: gravity points the opposite way from normal
                 float gn = sqrtf(gx * gx + gy * gy + gz * gz) + 1e-3f;
                 float dot = (gx * bx + gy * by + gz * bz) / gn;
@@ -132,6 +134,31 @@ static int MoodIndex(const char* n) {
     return -1;
 }
 
+// ----------------------------------------------------------------------------- body transform
+// Everything is designed on a 480x480 canvas, then drawn smaller (a little blob) and moved around
+// the screen by the wobble physics.
+static const float G_S = 0.70f;          // kitty size on screen
+static float G_OX = 0, G_OY = 0;         // where the blob has rolled to
+static float TX(float x) { return 240 + (x - 240) * G_S + G_OX; }
+static float TY(float y) { return 250 + (y - 250) * G_S + G_OY; }
+static int SW(int w) { int v = lroundf(w * G_S); return v < 1 ? 1 : v; }
+static lv_obj_t *s_glow, *s_body, *s_earf[2], *s_eari[2];
+static lv_obj_t *s_torso_glow, *s_torso, *s_tail_glow, *s_tail, *s_paw_glow[2], *s_paw[2], *s_star[2];
+static lv_point_precise_t s_earf_pts[2][3], s_eari_pts[2][3];
+
+// Fur themes: 0 = black kitty, 1 = white kitty, 2 = pastel pink kitty
+struct Theme { uint32_t fur, rim, ear_in, mouth, line_eye, blush, text; };
+static const Theme THEMES[3] = {
+    {0x1C1824, 0xA996E6, 0xFF8DB6, 0xFF9EC4, 0xFFBE46, 0xFF5C93, 0xC8BEFF},   // black, lavender glow
+    {0xFFF9FC, 0xFFB3D0, 0xFF8DB6, 0x9C3D63, 0xC9731A, 0xFF7BA6, 0x7A5CC8},   // white, pink rim
+    {0xFFC9DD, 0xFF8DB6, 0xFF86B0, 0x8E3459, 0xB8610F, 0xFF5C93, 0x7A5CC8},   // pastel pink
+};
+static int g_theme = 0;
+static std::atomic<int> g_pending_theme{-1};
+#define FUR (THEMES[g_theme].fur)
+#define RIMC (THEMES[g_theme].rim)
+#define LINE_EYE (THEMES[g_theme].line_eye)   // pastel pink kitty with a soft light rim
+
 // ----------------------------------------------------------------------------- tiny LVGL helpers
 static lv_obj_t* Blob(lv_obj_t* p, uint32_t color, lv_opa_t opa = LV_OPA_COVER) {
     lv_obj_t* o = lv_obj_create(p);
@@ -146,7 +173,7 @@ static lv_obj_t* Blob(lv_obj_t* p, uint32_t color, lv_opa_t opa = LV_OPA_COVER) 
 }
 static lv_obj_t* Stroke(lv_obj_t* p, uint32_t color, int width) {
     lv_obj_t* l = lv_line_create(p);
-    lv_obj_set_style_line_width(l, width, 0);
+    lv_obj_set_style_line_width(l, SW(width), 0);
     lv_obj_set_style_line_color(l, lv_color_hex(color), 0);
     lv_obj_set_style_line_rounded(l, true, 0);
     lv_obj_set_pos(l, 0, 0);
@@ -161,7 +188,7 @@ static lv_obj_t* Curve(lv_obj_t* p, uint32_t color, int width) {
     lv_obj_set_style_arc_opa(a, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_pad_all(a, 0, 0);
     lv_obj_set_style_arc_color(a, lv_color_hex(color), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(a, width, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(a, SW(width), LV_PART_INDICATOR);
     lv_obj_set_style_arc_rounded(a, true, LV_PART_INDICATOR);
     lv_arc_set_rotation(a, 0);
     lv_arc_set_bg_angles(a, 0, 360);
@@ -182,8 +209,13 @@ static void Show(lv_obj_t* o, bool on) {
     if (on && hidden) lv_obj_remove_flag(o, LV_OBJ_FLAG_HIDDEN);
     else if (!on && !hidden) lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
 }
-static void Box(lv_obj_t* o, float x, float y, float w, float h) {
+static void BoxRaw(lv_obj_t* o, float x, float y, float w, float h) {
     int ix = lroundf(x), iy = lroundf(y), iw = lroundf(w < 1 ? 1 : w), ih = lroundf(h < 1 ? 1 : h);
+    if (lv_obj_get_style_x(o, LV_PART_MAIN) != ix || lv_obj_get_style_y(o, LV_PART_MAIN) != iy) lv_obj_set_pos(o, ix, iy);
+    if (lv_obj_get_style_width(o, LV_PART_MAIN) != iw || lv_obj_get_style_height(o, LV_PART_MAIN) != ih) lv_obj_set_size(o, iw, ih);
+}
+static void Box(lv_obj_t* o, float x, float y, float w, float h) {
+    int ix = lroundf(TX(x)), iy = lroundf(TY(y)), iw = lroundf(w * G_S < 1 ? 1 : w * G_S), ih = lroundf(h * G_S < 1 ? 1 : h * G_S);
     if (lv_obj_get_style_x(o, LV_PART_MAIN) != ix || lv_obj_get_style_y(o, LV_PART_MAIN) != iy) lv_obj_set_pos(o, ix, iy);
     if (lv_obj_get_style_width(o, LV_PART_MAIN) != iw || lv_obj_get_style_height(o, LV_PART_MAIN) != ih) lv_obj_set_size(o, iw, ih);
 }
@@ -191,7 +223,7 @@ static void Circle(lv_obj_t* o, float cx, float cy, float d) { Box(o, cx - d / 2
 static void Line(lv_obj_t* l, lv_point_precise_t* store, const float* xy, int n) {
     bool diff = false;
     for (int i = 0; i < n; i++) {
-        lv_value_precise_t x = lroundf(xy[i * 2]), y = lroundf(xy[i * 2 + 1]);
+        lv_value_precise_t x = lroundf(TX(xy[i * 2])), y = lroundf(TY(xy[i * 2 + 1]));
         if (store[i].x != x || store[i].y != y) { store[i].x = x; store[i].y = y; diff = true; }
     }
     if (diff || lv_line_get_point_count(l) != (uint32_t)n) lv_line_set_points(l, store, n);
@@ -204,14 +236,14 @@ static void Color(lv_obj_t* o, uint32_t c) {
     lv_color_t col = lv_color_hex(c);
     if (!lv_color_eq(lv_obj_get_style_bg_color(o, LV_PART_MAIN), col)) lv_obj_set_style_bg_color(o, col, 0);
 }
-static void LineW(lv_obj_t* o, int w) { if (lv_obj_get_style_line_width(o, LV_PART_MAIN) != w) lv_obj_set_style_line_width(o, w, 0); }
+static void LineW(lv_obj_t* o, int w) { w = SW(w); if (lv_obj_get_style_line_width(o, LV_PART_MAIN) != w) lv_obj_set_style_line_width(o, w, 0); }
 static void LineC(lv_obj_t* o, uint32_t c) {
     lv_color_t col = lv_color_hex(c);
     if (!lv_color_eq(lv_obj_get_style_line_color(o, LV_PART_MAIN), col)) lv_obj_set_style_line_color(o, col, 0);
 }
 static void Radius(lv_obj_t* o, int r) { if (lv_obj_get_style_radius(o, LV_PART_MAIN) != r) lv_obj_set_style_radius(o, r, 0); }
 static void Pos(lv_obj_t* o, float x, float y) {
-    int ix = lroundf(x), iy = lroundf(y);
+    int ix = lroundf(TX(x)), iy = lroundf(TY(y));
     if (lv_obj_get_style_x(o, LV_PART_MAIN) != ix || lv_obj_get_style_y(o, LV_PART_MAIN) != iy) lv_obj_set_pos(o, ix, iy);
 }
 static void Spring(float& p, float& v, float target, float k = 0.16f, float damp = 0.30f) {
@@ -222,8 +254,8 @@ static uint32_t Rand(uint32_t lo, uint32_t hi) { return lo + esp_random() % (hi 
 
 // ----------------------------------------------------------------------------- build
 void Face::BuildEye(Eye& e) {
-    e.halo2 = Blob(root_, GOLD, 34);
-    e.halo1 = Blob(root_, GOLD, 70);
+    e.halo2 = Blob(root_, 0xFFFFFF, 60);
+    e.halo1 = Blob(root_, GOLD, 90);
     e.iris = Blob(root_, GOLD);
     lv_obj_set_style_bg_grad_dir(e.iris, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_border_width(e.iris, 4, 0);
@@ -232,14 +264,14 @@ void Face::BuildEye(Eye& e) {
     e.hl1 = Blob(root_, 0xFFFFFF);
     e.hl2 = Blob(root_, 0xFFFFFF);
     e.hl3 = Blob(root_, 0xFFF4C8);
-    e.arc = Curve(root_, GOLD, 13);
-    e.l1 = Stroke(root_, GOLD, 13);
+    e.arc = Curve(root_, LINE_EYE, 13);
+    e.l1 = Stroke(root_, LINE_EYE, 13);
     e.l2 = Stroke(root_, GOLD, 13);
     e.hc1 = Blob(root_, PINK);
     e.hc2 = Blob(root_, PINK);
-    e.star_v = Blob(root_, 0xFFD966);
-    e.star_h = Blob(root_, 0xFFD966);
-    e.lid = Stroke(root_, 0x000000, 60);
+    e.star_v = Blob(root_, 0xFFAA1E);
+    e.star_h = Blob(root_, 0xFFAA1E);
+    e.lid = Stroke(root_, FUR, 60);
     lv_obj_set_style_line_rounded(e.lid, false, 0);
 }
 
@@ -252,36 +284,81 @@ void Face::Create(lv_obj_t* parent) {
     lv_obj_add_flag(root_, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(root_, ClickCb, LV_EVENT_CLICKED, this);
 
-    ear_l_ = Stroke(root_, 0xFF96C3, 9);
-    ear_r_ = Stroke(root_, 0xFF96C3, 9);
+    s_tail_glow = Curve(root_, RIMC, 40);
+    s_tail = Curve(root_, FUR, 28);
+    s_torso_glow = Blob(root_, RIMC);
+    s_torso = Blob(root_, FUR);
+    for (int i = 0; i < 2; i++) { s_paw_glow[i] = Blob(root_, RIMC); s_paw[i] = Blob(root_, FUR); }
+    Show(s_tail_glow, true); Show(s_tail, true); Show(s_torso_glow, true); Show(s_torso, true);
+    for (int i = 0; i < 2; i++) { Show(s_paw_glow[i], true); Show(s_paw[i], true); }
+    s_glow = Blob(root_, RIMC);
+    for (int i = 0; i < 2; i++) { s_earf[i] = Stroke(root_, RIMC, 62); }
+    s_body = Blob(root_, FUR);
+    for (int i = 0; i < 2; i++) { s_eari[i] = Stroke(root_, FUR, 50); lv_obj_set_style_line_color(s_eari[i], lv_color_hex(FUR), 0); }
+    ear_l_ = Stroke(root_, 0xFF86B0, 18);
+    ear_r_ = Stroke(root_, 0xFF86B0, 18);
+    Show(s_glow, true); Show(s_body, true);
+    for (int i = 0; i < 2; i++) { Show(s_earf[i], true); Show(s_eari[i], true); }
+    s_star[0] = Blob(root_, 0xFFC93C); s_star[1] = Blob(root_, 0xFFC93C);
+    Show(s_star[0], true); Show(s_star[1], true);
     for (auto& e : eye_) BuildEye(e);
     for (int s = 0; s < 2; s++) {
-        blush_[s] = Blob(root_, 0xFF6EAA, 120);
-        for (int i = 0; i < 3; i++) hatch_[s][i] = Stroke(root_, 0xFFB4D2, 4);
+        blush_[s] = Blob(root_, 0xFF5C93, 120);
+        for (int i = 0; i < 3; i++) hatch_[s][i] = Stroke(root_, 0xE0457E, 4);
     }
-    w_l_ = Curve(root_, 0xFF96C3, 5);
-    w_r_ = Curve(root_, 0xFF96C3, 5);
-    frown_ = Curve(root_, 0xFF96C3, 5);
-    flat_ = Stroke(root_, 0xFF96C3, 5);
+    w_l_ = Curve(root_, 0x8E3459, 6);
+    w_r_ = Curve(root_, 0x8E3459, 6);
+    frown_ = Curve(root_, 0x8E3459, 6);
+    flat_ = Stroke(root_, 0x8E3459, 6);
     mouth_ = Blob(root_, 0x7A1232);
     lv_obj_set_style_radius(mouth_, 18, 0);
     lv_obj_set_style_border_width(mouth_, 4, 0);
-    lv_obj_set_style_border_color(mouth_, lv_color_hex(0xFF96C3), 0);
+    lv_obj_set_style_border_color(mouth_, lv_color_hex(0x8E3459), 0);
     tongue_in_ = Blob(mouth_, 0xFF6E96);
     lv_obj_remove_flag(tongue_in_, LV_OBJ_FLAG_HIDDEN);
     tongue_out_ = Blob(root_, 0xFF6E96);
     lv_obj_set_style_radius(tongue_out_, 9, 0);
-    for (int i = 0; i < 4; i++) { spark_[i][0] = Blob(root_, 0xFFE9A0); spark_[i][1] = Blob(root_, 0xFFE9A0); }
+    for (int i = 0; i < 4; i++) { spark_[i][0] = Blob(root_, 0xFFB020); spark_[i][1] = Blob(root_, 0xFFB020); }
     for (auto& t : tear_) t = Blob(root_, 0x78C8FF);
     sweat_ = Blob(root_, 0x8CD2FF);
     for (auto& a : anger_) a = Curve(root_, 0xFF3C50, 5);
-    zzz_[0] = Text(root_, "z", 0xC8BEFF); zzz_[1] = Text(root_, "Z", 0xC8BEFF); zzz_[2] = Text(root_, "Z", 0xC8BEFF);
-    qmark_ = Text(root_, "?", 0xC8BEFF);
+    zzz_[0] = Text(root_, "z", 0x7A5CC8); zzz_[1] = Text(root_, "Z", 0x7A5CC8); zzz_[2] = Text(root_, "Z", 0x7A5CC8);
+    qmark_ = Text(root_, "?", 0x7A5CC8);
     bang_ = Text(root_, "!", 0xFF5064);
 
     Show(ear_l_, true); Show(ear_r_, true); Show(blush_[0], true); Show(blush_[1], true);
+    if (g_pending_theme.load() < 0) g_pending_theme = g_theme;
     lv_timer_create(TickCb, 33, this);
 }
+
+static void ApplyTheme(lv_obj_t* const* lids, lv_obj_t* ear_l, lv_obj_t* ear_r, lv_obj_t* const* mouth_parts, int n_mouth,
+                       lv_obj_t* const* blush, lv_obj_t* const* texts, int n_text) {
+    const Theme& t = THEMES[g_theme];
+    lv_obj_t* rims[4] = {s_glow, s_torso_glow, s_paw_glow[0], s_paw_glow[1]};
+    lv_obj_t* furs[4] = {s_body, s_torso, s_paw[0], s_paw[1]};
+    for (lv_obj_t* o : rims) lv_obj_set_style_bg_color(o, lv_color_hex(t.rim), 0);
+    for (lv_obj_t* o : furs) lv_obj_set_style_bg_color(o, lv_color_hex(t.fur), 0);
+    lv_obj_set_style_arc_color(s_tail_glow, lv_color_hex(t.rim), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_tail, lv_color_hex(t.fur), LV_PART_INDICATOR);
+    for (int i = 0; i < 2; i++) {
+        lv_obj_set_style_line_color(s_earf[i], lv_color_hex(t.rim), 0);
+        lv_obj_set_style_line_color(s_eari[i], lv_color_hex(t.fur), 0);
+        lv_obj_set_style_line_color(lids[i], lv_color_hex(t.fur), 0);
+    }
+    lv_obj_set_style_line_color(ear_l, lv_color_hex(t.ear_in), 0);
+    lv_obj_set_style_line_color(ear_r, lv_color_hex(t.ear_in), 0);
+    for (int i = 0; i < n_mouth; i++) {
+        lv_obj_t* o = mouth_parts[i];
+        if (lv_obj_check_type(o, &lv_arc_class)) lv_obj_set_style_arc_color(o, lv_color_hex(t.mouth), LV_PART_INDICATOR);
+        else if (lv_obj_check_type(o, &lv_line_class)) lv_obj_set_style_line_color(o, lv_color_hex(t.mouth), 0);
+        else lv_obj_set_style_border_color(o, lv_color_hex(t.mouth), 0);
+    }
+    for (int i = 0; i < 2; i++) lv_obj_set_style_bg_color(blush[i], lv_color_hex(t.blush), 0);
+    for (int i = 0; i < n_text; i++) lv_obj_set_style_text_color(texts[i], lv_color_hex(t.text), 0);
+}
+
+void SetFurTheme(int theme) { if (theme >= 0 && theme < 3) g_pending_theme = theme; }
+int GetFurTheme() { return g_theme; }
 
 void Face::SetMood(const char* emotion) {
     int i = MoodIndex(emotion);
@@ -319,7 +396,7 @@ void Face::DrawEye(Eye& e, int side, float cx, float cy) {
 
     float px = cx + lx_ * 0.45f, py = cy + ly_ * 0.45f;   // whole eye shifts a bit, pupil shifts more
     if (open) {
-        Box(e.halo2, px - W / 2 - 26, py - H / 2 - 26, W + 52, H + 52); Color(e.halo2, col);
+        Box(e.halo2, px - W / 2 - 22, py - H / 2 - 22, W + 44, H + 44);
         Box(e.halo1, px - W / 2 - 11, py - H / 2 - 11, W + 22, H + 22); Color(e.halo1, col);
         Box(e.iris, px - W / 2, py - H / 2, W, H);
         Color(e.iris, col_top);
@@ -336,7 +413,7 @@ void Face::DrawEye(Eye& e, int side, float cx, float cy) {
     if (mode == HAPPY) { float d = W * 0.95f; ArcAt(e.arc, px, py + d * 0.22f, d, 200, 340); }
     if (mode == CLOSED) { float d = W * 0.95f; ArcAt(e.arc, px, py - d * 0.3f, d, 20, 160); }
     if (mode == SPIRAL) { float d = W * 0.9f; int a0 = (t_ * 28) % 360; ArcAt(e.arc, px, py, d, a0, a0 + 290); }
-    if (mode == XEYE || mode == HEART) LineC(e.l1, mode == HEART ? PINK : col);
+    if (mode == XEYE || mode == HEART) LineC(e.l1, mode == HEART ? PINK : LINE_EYE);
     if (mode == XEYE) {
         float s = W * 0.4f, dir = side < 0 ? 1.0f : -1.0f;   // left eye ">", right eye "<"
         float xy[6] = {px - dir * s, py - s * 0.85f, px + dir * s * 0.7f, py, px - dir * s, py + s * 0.85f};
@@ -377,6 +454,15 @@ void Face::DrawEye(Eye& e, int side, float cx, float cy) {
 // ----------------------------------------------------------------------------- frame
 void Face::Tick() {
     t_++;
+    int th = g_pending_theme.exchange(-1);
+    if (th >= 0) {
+        g_theme = th;
+        lv_obj_t* lids[2] = {eye_[0].lid, eye_[1].lid};
+        lv_obj_t* mouth_parts[5] = {w_l_, w_r_, frown_, flat_, mouth_};
+        lv_obj_t* texts[4] = {zzz_[0], zzz_[1], zzz_[2], qmark_};
+        ApplyTheme(lids, ear_l_, ear_r_, mouth_parts, 5, blush_, texts, 4);
+        for (auto& e : eye_) lv_obj_set_style_arc_color(e.arc, lv_color_hex(LINE_EYE), LV_PART_INDICATOR);
+    }
     int pm = pending_mood_.exchange(-1);
     if (pm >= 0 && pm != base_mood_) { base_mood_ = pm; vpop_ += 0.10f; }
     auto state0 = Application::GetInstance().GetDeviceState();
@@ -449,6 +535,48 @@ void Face::Tick() {
         next_blink_ = t_ + (Rand(0, 4) == 0 ? 9 : Rand(70, 190));   // sometimes a double blink
     }
 
+    // ---- wobble physics: the blob rolls with tilt and sloshes when shaken
+    {
+        static float vx = 0, vy = 0, sq = 0;
+        const float room_x = 240 - 255 * G_S - 4, room_y = 240 - 252 * G_S - 2;
+        float tgx = 0, tgy = 0;
+        if (g_imu_ok) {
+            tgx = fmaxf(-room_x, fminf(room_x, -g_tilt_y * 170));
+            tgy = fmaxf(-room_y, fminf(room_y, g_tilt_x * 140));
+            vx += -g_dyn_y * 22; vy += g_dyn_x * 22;
+        }
+        if (MOODS[mood_].eye == SPIRAL) { vx += (float)Rand(0, 12) - 6; vy += (float)Rand(0, 12) - 6; }
+        if (pop_ > 0.05f) vy -= pop_ * 6;                 // little hop on mood changes / pets
+        vx += (tgx - G_OX) * 0.07f; vy += (tgy - G_OY) * 0.07f;
+        vx *= 0.86f; vy *= 0.86f;
+        G_OX += vx; G_OY += vy;
+        if (fabsf(G_OX) > room_x) { G_OX = copysignf(room_x, G_OX); sq = fminf(0.10f, fabsf(vx) * 0.015f); vx = -vx * 0.45f; }
+        if (fabsf(G_OY) > room_y) { G_OY = copysignf(room_y, G_OY); sq = fminf(0.10f, fabsf(vy) * 0.015f); vy = -vy * 0.45f; }
+        if (fabsf(vx) < 0.05f && fabsf(vy) < 0.05f && fabsf(tgx - G_OX) < 0.4f && fabsf(tgy - G_OY) < 0.4f) { G_OX = tgx; G_OY = tgy; vx = vy = 0; }
+        sq *= 0.8f;
+        float speed = fminf(0.05f, sqrtf(vx * vx + vy * vy) * 0.004f);
+        float br = 2 * sinf(t_ * 0.07f);                       // breathing
+        float hw = 350 * (1 + sq + speed), hh = 320 * (1 - sq * 0.8f);   // head
+        float hy = 200 + (320 - hh) / 2 + br;
+        Box(s_body, 240 - hw / 2, hy - hh / 2, hw, hh);
+        Box(s_glow, 240 - hw / 2 - 7, hy - hh / 2 - 7, hw + 14, hh + 14);
+        float tw = 290 * (1 + sq * 0.5f), th2 = 190 + br * 2, ty0 = 410;   // sitting body
+        Box(s_torso, 240 - tw / 2, ty0 - th2 / 2, tw, th2);
+        Box(s_torso_glow, 240 - tw / 2 - 7, ty0 - th2 / 2 - 7, tw + 14, th2 + 14);
+        for (int i = 0; i < 2; i++) {
+            float px = 240 + (i ? 52 : -52), py = 488;
+            Box(s_paw[i], px - 40, py - 26, 80, 52);
+            Box(s_paw_glow[i], px - 46, py - 32, 92, 64);
+        }
+        float swish = ((MOODS[mood_].fx & EARWIG) || MOODS[mood_].eye == SPIRAL) ? 26 * sinf(t_ * 0.35f) : 12 * sinf(t_ * 0.08f);
+        int a0 = 300 + (int)swish, a1 = 420 + (int)swish;      // tail curls up the right side
+        ArcAt(s_tail_glow, 372, 400, 170, a0, a1);
+        ArcAt(s_tail, 372, 400, 170, a0 + 3, a1 - 3);
+        float st = 18 + 5 * fabsf(sinf(t_ * 0.12f)) + ((MOODS[mood_].fx & SPARK) ? 6 : 0);   // forehead star
+        Box(s_star[0], 240 - st * 0.22f, 92 + br - st, st * 0.44f, st * 2);
+        Box(s_star[1], 240 - st, 92 + br - st * 0.22f, st * 2, st * 0.44f);
+    }
+
     float bob = speaking ? 4 * fabsf(sinf(t_ * 0.45f)) : 0;
     float breathe = 4 * sinf(t_ * 0.07f) - bob;
     float cy = 200 + breathe;
@@ -457,14 +585,16 @@ void Face::Tick() {
 
     // ears (wiggle when happy)
     float wig = (m.fx & EARWIG) ? 6 * sinf(t_ * 0.6f) : ((t_ % 160) < 8 ? 3 * sinf(t_ * 1.2f) : 0);
-    float el[6] = {48, 124, 88 - wig, 34 + fabsf(wig), 160, 72};
-    float er[6] = {432, 124, 392 + wig, 34 + fabsf(wig), 320, 72};
+    float ef[2][6] = {{96, 130, 96 - wig, 0 + fabsf(wig), 182, 66}, {384, 130, 384 + wig, 0 + fabsf(wig), 298, 66}};
+    for (int i = 0; i < 2; i++) { Line(s_earf[i], s_earf_pts[i], ef[i], 3); Line(s_eari[i], s_eari_pts[i], ef[i], 3); }
+    float el[6] = {112, 112, 108 - wig, 30 + fabsf(wig), 160, 80};
+    float er[6] = {368, 112, 372 + wig, 30 + fabsf(wig), 320, 80};
     Line(ear_l_, ear_l_pts_, el, 3);
     Line(ear_r_, ear_r_pts_, er, 3);
 
     // blush + anime hatch lines
     for (int s = 0; s < 2; s++) {
-        float bx = s ? 390 : 90, by = 286 + breathe * 0.5f;
+        float bx = s ? 350 : 130, by = 286 + breathe * 0.5f;
         float bw = 74 + 10 * fminf(1, blush_amt_ - 1);
         Box(blush_[s], bx - bw / 2, by - 15, bw, 30);
         lv_opa_t op = (lv_opa_t)fminf(255, 40 + blush_amt_ * 100);
@@ -500,9 +630,9 @@ void Face::Tick() {
         else { mw = 46; mh = 24; }
         mouth_open_ += (mh - mouth_open_) * 0.5f;
         Box(mouth_, 240 - mw / 2, my - 6, mw, mouth_open_);
-        Radius(mouth_, lroundf(fminf(mw, mouth_open_) / 2));
+        Radius(mouth_, lroundf(fminf(mw, mouth_open_) / 2 * G_S));
         Show(tongue_in_, mouth_open_ > 20);
-        Box(tongue_in_, mw * 0.22f, mouth_open_ - 17, mw * 0.56f - 8, 11);
+        BoxRaw(tongue_in_, mw * 0.22f * G_S, (mouth_open_ - 17) * G_S, (mw * 0.56f - 8) * G_S, 11 * G_S);
     }
 
     // sparkles
@@ -542,6 +672,12 @@ void Face::Tick() {
     Show(bang_, m.fx & BANG); if (m.fx & BANG) Pos(bang_, 396, 88 - 4 * fabsf(sinf(t_ * 0.4f)));
     (void)idle;
 }
+
+#ifdef BEAN_SIM
+void SimMotion(float tx, float ty, float dx, float dy, bool shake) {
+    g_imu_ok = true; g_tilt_x = tx; g_tilt_y = ty; g_dyn_x = dx; g_dyn_y = dy; if (shake) g_shaken = true;
+}
+#endif
 
 Face& GetFace() {
     static Face face;
