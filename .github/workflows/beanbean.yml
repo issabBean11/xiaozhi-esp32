@@ -37,6 +37,7 @@ jobs:
           source $IDF_PATH/export.sh
           python scripts/build.py waveshare/esp32-c6-touch-amoled-2.16 --name esp32-c6-touch-amoled-2.16 --language en-US
           cp build/merged-binary.bin ../beanbean_c6_firmware.bin
+          cp build/xiaozhi.bin ../beanbean_c6_ota.bin
 
       - name: Keep the firmware file
         uses: actions/upload-artifact@v4
@@ -52,3 +53,14 @@ jobs:
           target_commitish: ${{ github.sha }}
           files: beanbean_c6_firmware.bin
           make_latest: true
+
+      - name: Publish the wireless-update file
+        shell: bash
+        run: |
+          mkdir ota && cp beanbean_c6_ota.bin ota/ && cd ota
+          echo "${{ github.sha }}" > version.txt
+          git init -q -b firmware
+          git config user.name "bean-bot"
+          git config user.email "bean-bot@users.noreply.github.com"
+          git add . && git commit -q -m "Bean Bean firmware ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" firmware
